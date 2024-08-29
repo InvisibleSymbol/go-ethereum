@@ -108,10 +108,11 @@ type freezerTable struct {
 
 	head   *os.File            // File descriptor for the data head of the table
 	index  *os.File            // File descriptor for the indexEntry file of the table
-	meta   *os.File            // File descriptor for metadata of the table
 	files  map[uint32]*os.File // open files
 	headId uint32              // number of the currently active head file
 	tailId uint32              // number of the earliest file
+
+	metadata *freezerTableMeta // metadata of the table
 
 	headBytes  int64         // Number of bytes written to the head file
 	readMeter  metrics.Meter // Meter for measuring the effective amount of data read
@@ -166,10 +167,15 @@ func newTable(path string, name string, readMeter metrics.Meter, writeMeter metr
 			return nil, err
 		}
 	}
+	// Load metadata from the file
+	metadata, err := newMetadata(meta)
+	if err != nil {
+		return nil, err
+	}
 	// Create the table and repair any past inconsistency
 	tab := &freezerTable{
 		index:         index,
-		meta:          meta,
+		metadata:      metadata,
 		files:         make(map[uint32]*os.File),
 		readMeter:     readMeter,
 		writeMeter:    writeMeter,
@@ -222,8 +228,9 @@ func (t *freezerTable) repair() error {
 		} // New file can't trigger this path
 	}
 	// Validate the index file as it might contain some garbage data after the
-	// power failures.
-	if err := t.repairIndex(); err != nil {
+	// power failures. The data before the 'IndexFlushOffset' are considered
+	// as fully flushed and can be skipped for verification.
+	if err := t.repairIndex(int64(t.metadata.indexFlushOffset)); err != nil {
 		return err
 	}
 	// Retrieve the file sizes and prepare for truncation. Note the file size
@@ -253,12 +260,14 @@ func (t *freezerTable) repair() error {
 	t.tailId = firstIndex.filenum
 	t.itemOffset.Store(uint64(firstIndex.offset))
 
-	// Load metadata from the file
-	meta, err := loadMetadata(t.meta, t.itemOffset.Load())
-	if err != nil {
-		return err
+	// Assign the number of hidden items (some of them have been removed
+	// from the tail).
+	if t.itemOffset.Load() > t.metadata.virtualTail {
+		if err := t.metadata.setVirtualTail(t.itemOffset.Load(), true); err != nil {
+			return err
+		}
 	}
-	t.itemHidden.Store(meta.VirtualTail)
+	t.itemHidden.Store(t.metadata.virtualTail)
 
 	// Read the last index, use the default value in case the freezer is empty
 	if offsetsSize == indexEntrySize {
@@ -345,9 +354,6 @@ func (t *freezerTable) repair() error {
 		if err := t.head.Sync(); err != nil {
 			return err
 		}
-		if err := t.meta.Sync(); err != nil {
-			return err
-		}
 	}
 	// Update the item and byte counters and return
 	t.items.Store(t.itemOffset.Load() + uint64(offsetsSize/indexEntrySize-1)) // last indexEntry points to the end of the data file
@@ -392,7 +398,7 @@ func (t *freezerTable) repair() error {
 // leftover garbage or if all items in the table have zero size is impossible.
 // In such instances, the file will remain unchanged to prevent potential data
 // loss or misinterpretation.
-func (t *freezerTable) repairIndex() error {
+func (t *freezerTable) repairIndex(checkOffset int64) error {
 	// Retrieve the file sizes and prepare for validation
 	stat, err := t.index.Stat()
 	if err != nil {
@@ -400,8 +406,13 @@ func (t *freezerTable) repairIndex() error {
 	}
 	size := stat.Size()
 
-	// Move the read cursor to the beginning of the file
-	_, err = t.index.Seek(0, io.SeekStart)
+	// Short circuit if the given check offset exceeds the range,
+	// which should never happen.
+	if checkOffset >= size {
+		return errors.New("index check offset out of range")
+	}
+	// Move the read cursor to the specified offset
+	_, err = t.index.Seek(checkOffset, io.SeekStart)
 	if err != nil {
 		return err
 	}
@@ -411,7 +422,6 @@ func (t *freezerTable) repairIndex() error {
 		start = time.Now()
 		buff  = make([]byte, indexEntrySize)
 		prev  indexEntry
-		head  indexEntry
 
 		read = func() (indexEntry, error) {
 			n, err := io.ReadFull(fr, buff)
@@ -436,27 +446,27 @@ func (t *freezerTable) repairIndex() error {
 			return nil
 		}
 	)
-	for offset := int64(0); offset < size; offset += indexEntrySize {
+	for offset := checkOffset; offset < size; offset += indexEntrySize {
 		entry, err := read()
 		if err != nil {
 			return err
 		}
-		if offset == 0 {
-			head = entry
+		if offset == checkOffset {
+			prev = entry
 			continue
 		}
-		// Ensure that the first non-head index refers to the earliest file,
-		// or the next file if the earliest file has no space to place the
-		// first item.
+		// Specialize if the index validation starts from zero, in which the offset
+		// field of the first index entry represents the number of deleted items
+		// from the tail, rather the offset in the data file. Therefore, skip the
+		// offset validation for the first two entries.
 		if offset == indexEntrySize {
-			if entry.filenum != head.filenum && entry.filenum != head.filenum+1 {
-				log.Error("Corrupted index item detected", "earliest", head.filenum, "filenumber", entry.filenum)
+			if entry.filenum != prev.filenum && entry.filenum != prev.filenum+1 {
+				log.Error("Corrupted index item detected", "earliest", prev.filenum, "next", entry.filenum)
 				return truncate(offset)
 			}
 			prev = entry
 			continue
 		}
-		// ensure two consecutive index items are in order
 		if err := t.checkIndexItems(prev, entry); err != nil {
 			log.Error("Corrupted index item detected", "err", err)
 			return truncate(offset)
@@ -470,7 +480,7 @@ func (t *freezerTable) repairIndex() error {
 	if err != nil {
 		return err
 	}
-	log.Debug("Verified index file", "items", size/indexEntrySize, "elapsed", common.PrettyDuration(time.Since(start)))
+	log.Debug("Verified index file", "items", (size-checkOffset)/indexEntrySize, "elapsed", common.PrettyDuration(time.Since(start)))
 	return nil
 }
 
@@ -550,6 +560,16 @@ func (t *freezerTable) truncateHead(items uint64) error {
 	// Truncate the index file first, the tail position is also considered
 	// when calculating the new freezer table length.
 	length := items - t.itemOffset.Load()
+
+	// If head truncation removes all items after the indexFlushOffset, reset it
+	// to zero to force a full re-validation of the index file on the next restart.
+	// This operation should be performed before modifying the index file. In the
+	// worst-case scenario, the offset modification could be persisted without any
+	// changes to the index file due to an unexpected power failure, resulting in
+	// some unnecessary validation workload.
+	if t.metadata.indexFlushOffset > (length+1)*indexEntrySize {
+		t.metadata.setIndexFlushOffset(0, true)
+	}
 	if err := truncateFreezerFile(t.index, int64(length+1)*indexEntrySize); err != nil {
 		return err
 	}
@@ -652,7 +672,10 @@ func (t *freezerTable) truncateTail(items uint64) error {
 	}
 	// Update the virtual tail marker and hidden these entries in table.
 	t.itemHidden.Store(items)
-	if err := writeMetadata(t.meta, newMetadata(items)); err != nil {
+
+	// Update the virtual tail without fsync, otherwise it will significantly
+	// impact the overall performance.
+	if err := t.metadata.setVirtualTail(items, false); err != nil {
 		return err
 	}
 	// Hidden items still fall in the current tail file, no data file
@@ -681,10 +704,18 @@ func (t *freezerTable) truncateTail(items uint64) error {
 		}
 		newDeleted = current
 	}
-	// Commit the changes of metadata file first before manipulating
-	// the indexes file.
-	if err := t.meta.Sync(); err != nil {
-		return err
+	// Move backward the index flush offset due to the index segment deletion
+	shorten := indexEntrySize * (newDeleted - deleted) // the size of deleted index items
+	if t.metadata.indexFlushOffset <= shorten {
+		// It's never expected to happen, reset the flush offset to zero just in case.
+		t.logger.Error("Reset the index flush offset", "current", t.metadata.indexFlushOffset, "shorten", shorten)
+		if err := t.metadata.setIndexFlushOffset(0, true); err != nil {
+			return err
+		}
+	} else {
+		if err := t.metadata.setIndexFlushOffset(t.metadata.indexFlushOffset-shorten, true); err != nil {
+			return err
+		}
 	}
 	// Close the index file before shorten it.
 	if err := t.index.Close(); err != nil {
@@ -746,7 +777,7 @@ func (t *freezerTable) Close() error {
 	// Trying to fsync a file opened in rdonly causes "Access denied"
 	// error on Windows.
 	doClose(t.index, true, true)
-	doClose(t.meta, true, true)
+	doClose(t.metadata.file, true, true)
 
 	// The preopened non-head data-files are all opened in readonly.
 	// The head is opened in rw-mode, so we sync it here - but since it's also
@@ -757,7 +788,6 @@ func (t *freezerTable) Close() error {
 		doClose(f, false, true) // close but do not sync
 	}
 	t.index = nil
-	t.meta = nil
 	t.head = nil
 
 	if errs != nil {
@@ -917,7 +947,7 @@ func (t *freezerTable) retrieveItems(start, count, maxBytes uint64) ([]byte, []i
 	defer t.lock.RUnlock()
 
 	// Ensure the table and the item are accessible
-	if t.index == nil || t.head == nil || t.meta == nil {
+	if t.index == nil || t.head == nil {
 		return nil, nil, errClosed
 	}
 	var (
@@ -1042,6 +1072,19 @@ func (t *freezerTable) advanceHead() error {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
+	// Flush the index file content into disk whenever the head is advanced.
+	// It should be performed before updating the index flush offset.
+	if err := t.index.Sync(); err != nil {
+		return err
+	}
+	// Move forward the flush offset to skip unnecessary validation workload
+	stat, err := t.index.Stat()
+	if err != nil {
+		return err
+	}
+	if err := t.metadata.setIndexFlushOffset(uint64(stat.Size()), true); err != nil {
+		return err
+	}
 	// We open the next file in truncated mode -- if this file already
 	// exists, we need to start over from scratch on it.
 	nextID := t.headId + 1
@@ -1069,7 +1112,7 @@ func (t *freezerTable) advanceHead() error {
 func (t *freezerTable) Sync() error {
 	t.lock.Lock()
 	defer t.lock.Unlock()
-	if t.index == nil || t.head == nil || t.meta == nil {
+	if t.index == nil || t.head == nil {
 		return errClosed
 	}
 	var err error
@@ -1078,10 +1121,9 @@ func (t *freezerTable) Sync() error {
 			err = e
 		}
 	}
-
 	trackError(t.index.Sync())
-	trackError(t.meta.Sync())
 	trackError(t.head.Sync())
+	trackError(t.metadata.file.Sync())
 	return err
 }
 
@@ -1097,13 +1139,8 @@ func (t *freezerTable) dumpIndexString(start, stop int64) string {
 }
 
 func (t *freezerTable) dumpIndex(w io.Writer, start, stop int64) {
-	meta, err := readMetadata(t.meta)
-	if err != nil {
-		fmt.Fprintf(w, "Failed to decode freezer table %v\n", err)
-		return
-	}
-	fmt.Fprintf(w, "Version %d count %d, deleted %d, hidden %d\n", meta.Version,
-		t.items.Load(), t.itemOffset.Load(), t.itemHidden.Load())
+	fmt.Fprintf(w, "Version %d count %d, deleted %d, hidden %d\n",
+		t.metadata.version, t.items.Load(), t.itemOffset.Load(), t.itemHidden.Load())
 
 	buf := make([]byte, indexEntrySize)
 

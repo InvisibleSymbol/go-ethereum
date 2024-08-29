@@ -1394,7 +1394,7 @@ func TestIndexValidation(t *testing.T) {
 			data:     garbage.append(nil),
 			expItems: 0,
 		},
-		// write garbage in the first non-head item
+		// write garbage in the middle
 		{
 			offset:   (items/2 + 1) * indexEntrySize,
 			data:     garbage.append(nil),
@@ -1430,6 +1430,117 @@ func TestIndexValidation(t *testing.T) {
 		}
 		if f.items.Load() != uint64(c.expItems) {
 			t.Fatalf("Unexpected item number, want: %d, got: %d", c.expItems, f.items.Load())
+		}
+	}
+}
+
+func TestIndexFlushOffsetTracking(t *testing.T) {
+	const (
+		items    = 35
+		dataSize = 10
+		fileSize = 100
+	)
+	fn := fmt.Sprintf("t-%d", rand.Uint64())
+	f, err := newTable(os.TempDir(), fn, metrics.NewMeter(), metrics.NewMeter(), metrics.NewGauge(), fileSize, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Data files:
+	//   F1(10 items) -> F2(10 items) -> F3(10 items) -> F4(5 items, non-full)
+	writeChunks(t, f, items, dataSize)
+
+	var cases = []struct {
+		op     func(*freezerTable)
+		offset uint64
+	}{
+		{
+			// Data files:
+			//   F1(10 items) -> F2(10 items) -> F3(10 items) -> F4(5 items, non-full)
+			func(f *freezerTable) {}, // no-op
+			31 * indexEntrySize,
+		},
+		{
+			// Write more items to fulfill the newest data file, but the file advance
+			// is not triggered.
+
+			// Data files:
+			//   F1(10 items) -> F2(10 items) -> F3(10 items) -> F4(10 items, full)
+			func(f *freezerTable) {
+				batch := f.newBatch()
+				for i := 0; i < 5; i++ {
+					batch.AppendRaw(items+uint64(i), make([]byte, dataSize))
+				}
+				batch.commit()
+			},
+			31 * indexEntrySize,
+		},
+		{
+			// Write more items to trigger the data file advance
+
+			// Data files:
+			//   F1(10 items) -> F2(10 items) -> F3(10 items) -> F4(10 items) -> F5(1 item)
+			func(f *freezerTable) {
+				batch := f.newBatch()
+				batch.AppendRaw(items+5, make([]byte, dataSize))
+				batch.commit()
+			},
+			41 * indexEntrySize,
+		},
+		{
+			// Head truncate
+
+			// Data files:
+			//   F1(10 items) -> F2(10 items) -> F3(10 items) -> F4(10 items) -> F5(0 item)
+			func(f *freezerTable) {
+				f.truncateHead(items + 5)
+			},
+			41 * indexEntrySize,
+		},
+		{
+			// Tail truncate
+
+			// Data files:
+			//   F1(1 hidden, 9 visible) -> F2(10 items) -> F3(10 items) -> F4(10 items) -> F5(0 item)
+			func(f *freezerTable) {
+				f.truncateTail(1)
+			},
+			41 * indexEntrySize,
+		},
+		{
+			// Tail truncate
+
+			// Data files:
+			//   F2(10 items) -> F3(10 items) -> F4(10 items) -> F5(0 item)
+			func(f *freezerTable) {
+				f.truncateTail(10)
+			},
+			31 * indexEntrySize,
+		},
+		{
+			// Tail truncate
+
+			// Data files:
+			//   F4(10 items) -> F5(0 item)
+			func(f *freezerTable) {
+				f.truncateTail(30)
+			},
+			11 * indexEntrySize,
+		},
+		{
+			// Head truncate
+
+			// Data files:
+			//   F4(9 items)
+			func(f *freezerTable) {
+				f.truncateHead(items + 4)
+			},
+			0,
+		},
+	}
+	for _, c := range cases {
+		c.op(f)
+		if f.metadata.indexFlushOffset != c.offset {
+			t.Fatalf("Unexpected index flush offset, want: %d, got: %d", c.offset, f.metadata.indexFlushOffset)
 		}
 	}
 }

@@ -194,6 +194,8 @@ func (batch *freezerTableBatch) commit() error {
 	dataSize := int64(len(batch.dataBuffer))
 	batch.dataBuffer = batch.dataBuffer[:0]
 
+	// index file is only fysnc'd when the head data file is advanced
+	// for reducing the overhead.
 	_, err = batch.t.index.Write(batch.indexBuffer)
 	if err != nil {
 		return err
